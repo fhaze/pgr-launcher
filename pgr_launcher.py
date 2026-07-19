@@ -11,6 +11,7 @@ downloader needs, and launches the game through Proton/steamrt.
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -84,6 +85,38 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+def detect_installed_version(game_dir) -> str | None:
+    """Read the installed version from the game directory, if present.
+
+    Prefers launcherDownloadConfig.json (proper JSON, written by the launcher);
+    falls back to the game's own version.json, which uses a non-standard format
+    like ``{package_version:4.6.0}``.
+    """
+    game_dir = Path(game_dir)
+
+    dl = game_dir / "launcherDownloadConfig.json"
+    if dl.exists():
+        try:
+            with open(dl) as f:
+                version = json.load(f).get("version")
+            if version:
+                return version
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    vj = game_dir / "version.json"
+    if vj.exists():
+        try:
+            match = re.search(r"package_version\s*:\s*([0-9][0-9.]*)",
+                              vj.read_text())
+            if match:
+                return match.group(1)
+        except OSError:
+            pass
+
+    return None
 
 
 # ─── CDN API client ─────────────────────────────────────────────────
@@ -506,13 +539,22 @@ class MainWindow(QMainWindow):
         """Fetch the CDN version without verifying files (runs off-thread)."""
         self.status_label.setText("Checking for new version...")
 
+        # Detect the installed version from the game files (source of truth),
+        # falling back to whatever a prior update run recorded in config.
+        installed = (
+            detect_installed_version(self.config["game_dir"])
+            or self.config.get("installed_version")
+        )
+        if installed and installed != self.config.get("installed_version"):
+            self.config["installed_version"] = installed
+            save_config(self.config)
+
         def check():
             try:
                 cdn_config = fetch_cdn_config()
                 info = parse_version_info(cdn_config)
                 self.version_info = info
                 latest = info["version"]
-                installed = self.config.get("installed_version")
                 if installed == latest:
                     self.version_label.setText(
                         f"Installed: {installed}    Latest: {latest} ✓"
