@@ -377,9 +377,13 @@ def launch_game(config: dict) -> subprocess.Popen:
     env["SteamAppId"] = "0"
     env["SteamGameId"] = "0"
 
+    # reaper runs on the host and wraps the steamrt entry point, which enters
+    # the pressure-vessel container and runs Proton. reaper must be outermost:
+    # it lives under /usr, which the container refuses to bind-mount, so it can
+    # never be executed from inside the container.
     cmd = [
-        steamrt, "--verb=waitforexitandrun", "--",
         reaper, "SteamLaunch", "AppId=0", "--",
+        steamrt, "--verb=waitforexitandrun", "--",
         proton, "waitforexitandrun", exe_z, graphics,
     ]
 
