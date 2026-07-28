@@ -22,7 +22,7 @@ from threading import Thread
 import requests
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
@@ -530,7 +530,7 @@ class SettingsDialog(QDialog):
 
 
 DARK_STYLESHEET = """
-QMainWindow, QWidget {
+QMainWindow {
     background-color: #0f0f1a;
     color: #e0e0e0;
     font-size: 13px;
@@ -540,7 +540,7 @@ QLabel {
     background: transparent;
 }
 QPushButton {
-    background-color: #2a2a4a;
+    background-color: rgba(42, 42, 74, 220);
     color: #e0e0e0;
     border: 1px solid #3d3d66;
     border-radius: 4px;
@@ -548,14 +548,14 @@ QPushButton {
     font-weight: bold;
 }
 QPushButton:hover {
-    background-color: #3d3d66;
+    background-color: rgba(61, 61, 102, 230);
     border-color: #6c5ce7;
 }
 QPushButton:pressed {
-    background-color: #1e1e3a;
+    background-color: rgba(30, 30, 58, 230);
 }
 QPushButton:disabled {
-    background-color: #1a1a2a;
+    background-color: rgba(26, 26, 42, 220);
     color: #666;
     border-color: #2a2a3a;
 }
@@ -563,7 +563,7 @@ QProgressBar {
     border: 1px solid #3d3d66;
     border-radius: 4px;
     text-align: center;
-    background-color: #1a1a2e;
+    background-color: rgba(26, 26, 46, 220);
     color: #e0e0e0;
 }
 QProgressBar::chunk {
@@ -571,7 +571,7 @@ QProgressBar::chunk {
     border-radius: 3px;
 }
 QTextEdit {
-    background-color: #11111f;
+    background-color: rgba(17, 17, 31, 220);
     color: #b0b0b0;
     border: 1px solid #2a2a4a;
     border-radius: 4px;
@@ -579,7 +579,7 @@ QTextEdit {
     font-size: 12px;
 }
 QComboBox, QLineEdit {
-    background-color: #1a1a2e;
+    background-color: rgba(26, 26, 46, 230);
     color: #e0e0e0;
     border: 1px solid #3d3d66;
     border-radius: 3px;
@@ -591,6 +591,60 @@ QDialog {
 """
 
 
+class BackgroundWidget(QWidget):
+    """Widget that paints a banner image as its background (cover mode)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._banner_pixmap = None
+        self._scaled_banner = None
+
+    def set_banner(self, path: str):
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return
+        self._banner_pixmap = pixmap
+        self._scaled_banner = None
+        self.update()
+
+    def _get_scaled_banner(self):
+        if self._banner_pixmap is None:
+            return None
+        size = self.size()
+        if self._scaled_banner is not None and self._scaled_banner[0] == size:
+            return self._scaled_banner[1]
+        scaled = self._banner_pixmap.scaled(
+            size,
+            Qt.KeepAspectRatioByExpanding,
+            Qt.SmoothTransformation,
+        )
+        self._scaled_banner = (size, scaled)
+        return scaled
+
+    def paintEvent(self, event):
+        banner = self._get_scaled_banner()
+        painter = QPainter(self)
+
+        if banner is not None:
+            x = (self.width() - banner.width()) // 2
+            y = (self.height() - banner.height()) // 2
+            painter.drawPixmap(x, y, banner)
+        else:
+            super().paintEvent(event)
+
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        gradient.setColorAt(0.0, QColor(15, 15, 26, 0))
+        gradient.setColorAt(0.45, QColor(15, 15, 26, 40))
+        gradient.setColorAt(0.75, QColor(15, 15, 26, 180))
+        gradient.setColorAt(1.0, QColor(15, 15, 26, 220))
+        painter.fillRect(self.rect(), gradient)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._scaled_banner = None
+        self.update()
+
+
 class MainWindow(QMainWindow):
     banner_loaded = Signal(str)  # emits local path to cached banner image
 
@@ -598,9 +652,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = load_config()
         self.version_info = None
-        self._banner_pixmap = None
         self.setWindowTitle("PGR BiliBili CN Launcher")
-        self.setMinimumSize(780, 620)
+        self.setMinimumSize(960, 570)
+        self.resize(1280, 760)
         self.setStyleSheet(DARK_STYLESHEET)
         self._build_ui()
         self.banner_loaded.connect(self._apply_banner)
@@ -609,29 +663,27 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._quick_version_check)
 
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setSpacing(8)
+        self.bg_widget = BackgroundWidget()
+        self.setCentralWidget(self.bg_widget)
 
-        # Banner image (loaded asynchronously).
-        self.banner_label = QLabel()
-        self.banner_label.setAlignment(Qt.AlignCenter)
-        self.banner_label.setMinimumHeight(200)
-        self.banner_label.setMaximumHeight(220)
-        self.banner_label.setStyleSheet(
-            "border-radius: 8px; background: #1a1a2e;"
-        )
-        layout.addWidget(self.banner_label)
+        layout = QVBoxLayout(self.bg_widget)
+        layout.setContentsMargins(48, 24, 48, 48)
+        layout.setSpacing(12)
+
+        layout.addStretch(10)
 
         title = QLabel(GAME_NAME)
-        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #a29bfe;")
+        title.setStyleSheet(
+            "font-size: 20px; font-weight: bold; color: #a29bfe;"
+        )
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
         self.version_label = QLabel("Checking version...")
         self.version_label.setAlignment(Qt.AlignCenter)
-        self.version_label.setStyleSheet("color: #888; font-size: 12px;")
+        self.version_label.setStyleSheet(
+            "color: #c0c0c0; font-size: 13px;"
+        )
         layout.addWidget(self.version_label)
 
         self.progress = QProgressBar()
@@ -640,7 +692,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress)
 
         self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #b0b0b0;")
+        self.status_label.setStyleSheet("color: #d0d0d0;")
         layout.addWidget(self.status_label)
 
         btn_layout = QHBoxLayout()
@@ -657,7 +709,7 @@ class MainWindow(QMainWindow):
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(150)
+        self.log.setMaximumHeight(160)
         layout.addWidget(self.log)
 
         self.btn_update.clicked.connect(self._on_update)
@@ -669,35 +721,11 @@ class MainWindow(QMainWindow):
         ts = datetime.now().strftime("%H:%M:%S")
         self.log.append(f"[{ts}] {msg}")
 
-    # ─── Banner ─────────────────────────────────────────────────────
+    # ─── Banner background ──────────────────────────────────────────
 
     def _apply_banner(self, path: str):
-        """Load and display the banner image, scaled to fit the label."""
-        pixmap = QPixmap(path)
-        if pixmap.isNull():
-            return
-        self._banner_pixmap = pixmap
-        self._scale_banner()
-
-    def _scale_banner(self):
-        """Scale the cached banner pixmap to the current banner label width."""
-        if self._banner_pixmap is None:
-            return
-        label_width = self.banner_label.width() - 4  # small padding
-        if label_width <= 0:
-            return
-        scaled = self._banner_pixmap.scaledToWidth(
-            label_width, Qt.SmoothTransformation
-        )
-        # Cap height to max 200px to prevent overflow.
-        if scaled.height() > 200:
-            scaled = scaled.scaledToHeight(200, Qt.SmoothTransformation)
-        self.banner_label.setPixmap(scaled)
-        self.banner_label.setStyleSheet("border-radius: 8px;")
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._scale_banner()
+        """Load the banner image and set it as the central widget background."""
+        self.bg_widget.set_banner(path)
 
     # ─── Startup version check ──────────────────────────────────────
 
