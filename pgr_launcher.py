@@ -218,6 +218,32 @@ def download_banner(url: str, version: str) -> Path:
     return local_path
 
 
+def get_cached_banner_path(preferred_version: str | None = None) -> Path | None:
+    """Find the best cached banner path without any network calls.
+
+    Tries, in order:
+      1. The banner matching *preferred_version* (usually the locally installed version).
+      2. The most recently modified banner_*.webp file in the cache directory.
+    Returns None if no usable cached banner exists.
+    """
+    if not BANNER_CACHE_DIR.is_dir():
+        return None
+
+    if preferred_version:
+        p = BANNER_CACHE_DIR / f"banner_{preferred_version}.webp"
+        if p.exists() and p.stat().st_size > 0:
+            return p
+
+    candidates = [
+        p for p in BANNER_CACHE_DIR.glob("banner_*.webp")
+        if p.is_file() and p.stat().st_size > 0
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 # ─── Update worker ──────────────────────────────────────────────────
 
 
@@ -658,6 +684,17 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(DARK_STYLESHEET)
         self._build_ui()
         self.banner_loaded.connect(self._apply_banner)
+
+        # Show the best cached banner immediately so the UI is not blank while
+        # the network version check runs in the background. The cached image
+        # will be replaced later if a newer banner is available.
+        installed_version = (
+            detect_installed_version(self.config["game_dir"])
+            or self.config.get("installed_version")
+        )
+        cached_banner = get_cached_banner_path(installed_version)
+        if cached_banner is not None:
+            self.bg_widget.set_banner(str(cached_banner))
 
         # Quick version check + banner load on startup.
         QTimer.singleShot(500, self._quick_version_check)
