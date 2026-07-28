@@ -22,6 +22,7 @@ from threading import Thread
 import requests
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
@@ -41,6 +42,18 @@ GAME_NAME = "Punishing: Gray Raven (BiliBili CN)"
 GAME_EXE = "PGR.exe"
 CONFIG_PATH = Path(__file__).parent / "config.json"
 USER_AGENT = "PGR-Launcher/1.0"
+
+# Launcher UI config (banner/background assets).
+LAUNCHER_INDEX_URL = (
+    f"https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/launcher/"
+    f"{APP_ID}_{APP_KEY}/{GAME_ID}/index.json"
+)
+LAUNCHER_BG_TEMPLATE = (
+    f"https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/"
+    f"{APP_ID}_{APP_KEY}/{GAME_ID}/background/{{slug}}/{{locale}}.json"
+)
+BANNER_LOCALES = ("zh-Hans", "zh-CN", "zh", "en")
+BANNER_CACHE_DIR = Path(__file__).parent / "assets" / "cache"
 
 # Files at or above this size skip md5 verification during the check phase to
 # keep verification fast; a size match is trusted for them.
@@ -165,6 +178,44 @@ def get_download_url(version_info: dict, dest: str) -> str:
     ver = version_info["version"]
     h = version_info["hash"]
     return f"{host}launcher/game/{GAME_ID}/{APP_ID}/{ver}/{h}/zip/{dest}"
+
+
+def fetch_banner_url() -> str:
+    """Fetch the official launcher banner image URL for the current patch.
+
+    Follows the same 3-step chain the official Kuro launcher uses:
+      1. GET launcher index -> extracts functionCode.background slug
+      2. GET per-locale background descriptor -> extracts firstFrameImage URL
+    Tries each locale in BANNER_LOCALES until one returns 200.
+    Returns the static banner (webp) URL.
+    """
+    resp = requests.get(
+        LAUNCHER_INDEX_URL, timeout=15, headers={"User-Agent": USER_AGENT}
+    )
+    resp.raise_for_status()
+    bg_slug = resp.json()["functionCode"]["background"]
+
+    for locale in BANNER_LOCALES:
+        url = LAUNCHER_BG_TEMPLATE.format(slug=bg_slug, locale=locale)
+        r = requests.get(url, timeout=15, headers={"User-Agent": USER_AGENT})
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("firstFrameImage", "")
+
+    raise RuntimeError("Could not fetch banner URL (all locales failed)")
+
+
+def download_banner(url: str, version: str) -> Path:
+    """Download the banner image and cache it locally. Returns the local path."""
+    BANNER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    local_path = BANNER_CACHE_DIR / f"banner_{version}.webp"
+    if local_path.exists() and local_path.stat().st_size > 0:
+        return local_path
+    resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+    resp.raise_for_status()
+    with open(local_path, "wb") as f:
+        f.write(resp.content)
+    return local_path
 
 
 # ─── Update worker ──────────────────────────────────────────────────
@@ -478,37 +529,118 @@ class SettingsDialog(QDialog):
 # ─── Main window ────────────────────────────────────────────────────
 
 
+DARK_STYLESHEET = """
+QMainWindow, QWidget {
+    background-color: #0f0f1a;
+    color: #e0e0e0;
+    font-size: 13px;
+}
+QLabel {
+    color: #d0d0d0;
+    background: transparent;
+}
+QPushButton {
+    background-color: #2a2a4a;
+    color: #e0e0e0;
+    border: 1px solid #3d3d66;
+    border-radius: 4px;
+    padding: 8px 18px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background-color: #3d3d66;
+    border-color: #6c5ce7;
+}
+QPushButton:pressed {
+    background-color: #1e1e3a;
+}
+QPushButton:disabled {
+    background-color: #1a1a2a;
+    color: #666;
+    border-color: #2a2a3a;
+}
+QProgressBar {
+    border: 1px solid #3d3d66;
+    border-radius: 4px;
+    text-align: center;
+    background-color: #1a1a2e;
+    color: #e0e0e0;
+}
+QProgressBar::chunk {
+    background-color: #6c5ce7;
+    border-radius: 3px;
+}
+QTextEdit {
+    background-color: #11111f;
+    color: #b0b0b0;
+    border: 1px solid #2a2a4a;
+    border-radius: 4px;
+    font-family: "Consolas", "Monaco", monospace;
+    font-size: 12px;
+}
+QComboBox, QLineEdit {
+    background-color: #1a1a2e;
+    color: #e0e0e0;
+    border: 1px solid #3d3d66;
+    border-radius: 3px;
+    padding: 4px;
+}
+QDialog {
+    background-color: #0f0f1a;
+}
+"""
+
+
 class MainWindow(QMainWindow):
+    banner_loaded = Signal(str)  # emits local path to cached banner image
+
     def __init__(self):
         super().__init__()
         self.config = load_config()
         self.version_info = None
+        self._banner_pixmap = None
         self.setWindowTitle("PGR BiliBili CN Launcher")
-        self.setMinimumSize(700, 500)
+        self.setMinimumSize(780, 620)
+        self.setStyleSheet(DARK_STYLESHEET)
         self._build_ui()
+        self.banner_loaded.connect(self._apply_banner)
 
-        # Quick version check on startup (no file verification).
+        # Quick version check + banner load on startup.
         QTimer.singleShot(500, self._quick_version_check)
 
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
+        layout.setSpacing(8)
+
+        # Banner image (loaded asynchronously).
+        self.banner_label = QLabel()
+        self.banner_label.setAlignment(Qt.AlignCenter)
+        self.banner_label.setMinimumHeight(200)
+        self.banner_label.setMaximumHeight(220)
+        self.banner_label.setStyleSheet(
+            "border-radius: 8px; background: #1a1a2e;"
+        )
+        layout.addWidget(self.banner_label)
 
         title = QLabel(GAME_NAME)
-        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #a29bfe;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
         self.version_label = QLabel("Checking version...")
         self.version_label.setAlignment(Qt.AlignCenter)
+        self.version_label.setStyleSheet("color: #888; font-size: 12px;")
         layout.addWidget(self.version_label)
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
+        self.progress.setFixedHeight(22)
         layout.addWidget(self.progress)
 
         self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: #b0b0b0;")
         layout.addWidget(self.status_label)
 
         btn_layout = QHBoxLayout()
@@ -537,6 +669,36 @@ class MainWindow(QMainWindow):
         ts = datetime.now().strftime("%H:%M:%S")
         self.log.append(f"[{ts}] {msg}")
 
+    # ─── Banner ─────────────────────────────────────────────────────
+
+    def _apply_banner(self, path: str):
+        """Load and display the banner image, scaled to fit the label."""
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            return
+        self._banner_pixmap = pixmap
+        self._scale_banner()
+
+    def _scale_banner(self):
+        """Scale the cached banner pixmap to the current banner label width."""
+        if self._banner_pixmap is None:
+            return
+        label_width = self.banner_label.width() - 4  # small padding
+        if label_width <= 0:
+            return
+        scaled = self._banner_pixmap.scaledToWidth(
+            label_width, Qt.SmoothTransformation
+        )
+        # Cap height to max 200px to prevent overflow.
+        if scaled.height() > 200:
+            scaled = scaled.scaledToHeight(200, Qt.SmoothTransformation)
+        self.banner_label.setPixmap(scaled)
+        self.banner_label.setStyleSheet("border-radius: 8px;")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._scale_banner()
+
     # ─── Startup version check ──────────────────────────────────────
 
     def _quick_version_check(self):
@@ -554,14 +716,24 @@ class MainWindow(QMainWindow):
             save_config(self.config)
 
         def check():
+            banner_path = None
             try:
                 cdn_config = fetch_cdn_config()
                 info = parse_version_info(cdn_config)
                 self.version_info = info
                 latest = info["version"]
+
+                # Load banner for the latest version.
+                try:
+                    banner_url = fetch_banner_url()
+                    if banner_url:
+                        banner_path = str(download_banner(banner_url, latest))
+                except Exception as be:
+                    print(f"Banner load failed: {be}", file=sys.stderr)
+
                 if installed == latest:
                     self.version_label.setText(
-                        f"Installed: {installed}    Latest: {latest} ✓"
+                        f"Installed: {installed}    Latest: {latest} \u2713"
                     )
                     self.status_label.setText("Up to date")
                 else:
@@ -573,6 +745,9 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.version_label.setText("Version check failed")
                 self.status_label.setText(f"Error: {e}")
+
+            if banner_path:
+                self.banner_loaded.emit(banner_path)
 
         Thread(target=check, daemon=True).start()
 
