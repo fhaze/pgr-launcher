@@ -14,19 +14,31 @@ import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 
 import requests
-
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QLockFile, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QTextEdit, QVBoxLayout, QWidget,
+    QApplication,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 # ─── Constants ───────────────────────────────────────────────────────
@@ -58,6 +70,11 @@ BANNER_CACHE_DIR = Path(__file__).parent / "assets" / "cache"
 # Files at or above this size skip md5 verification during the check phase to
 # keep verification fast; a size match is trusted for them.
 MD5_SKIP_SIZE = 100_000_000
+
+# Per-file retries for transient CDN errors (timeouts, stalls, dropped or
+# truncated connections). Attempts are spaced by a linear backoff.
+MAX_DOWNLOAD_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 2
 
 # ─── Config ─────────────────────────────────────────────────────────
 
@@ -122,8 +139,7 @@ def detect_installed_version(game_dir) -> str | None:
     vj = game_dir / "version.json"
     if vj.exists():
         try:
-            match = re.search(r"package_version\s*:\s*([0-9][0-9.]*)",
-                              vj.read_text())
+            match = re.search(r"package_version\s*:\s*([0-9][0-9.]*)", vj.read_text())
             if match:
                 return match.group(1)
         except OSError:
@@ -137,9 +153,7 @@ def detect_installed_version(game_dir) -> str | None:
 
 def fetch_cdn_config() -> dict:
     """Fetch the stable config endpoint. Returns the full JSON document."""
-    resp = requests.get(
-        CONFIG_URL, timeout=15, headers={"User-Agent": USER_AGENT}
-    )
+    resp = requests.get(CONFIG_URL, timeout=15, headers={"User-Agent": USER_AGENT})
     resp.raise_for_status()
     return resp.json()
 
@@ -178,6 +192,93 @@ def get_download_url(version_info: dict, dest: str) -> str:
     ver = version_info["version"]
     h = version_info["hash"]
     return f"{host}launcher/game/{GAME_ID}/{APP_ID}/{ver}/{h}/zip/{dest}"
+
+
+class ByteCounter:
+    """Thread-safe byte counter the UI can poll to display download speed.
+
+    ``count`` is a plain int attribute: writes go through the lock so the 8
+    download workers never lose an increment, while reads from the GUI thread
+    are a single atomic attribute load (safe under the GIL).
+    """
+
+    def __init__(self):
+        self._lock = Lock()
+        self.count = 0
+
+    def add(self, n: int):
+        with self._lock:
+            self.count += n
+
+
+def format_speed(bytes_per_sec: float) -> str:
+    if bytes_per_sec >= 1024**3:
+        return f"{bytes_per_sec / 1024**3:.2f} GB/s"
+    if bytes_per_sec >= 1024**2:
+        return f"{bytes_per_sec / 1024**2:.1f} MB/s"
+    if bytes_per_sec >= 1024:
+        return f"{bytes_per_sec / 1024:.0f} KB/s"
+    return f"{bytes_per_sec:.0f} B/s"
+
+
+def download_file(
+    url: str,
+    expected_md5: str,
+    local_path: Path,
+    cancel_check=None,
+    on_retry=None,
+    byte_counter=None,
+) -> str | None:
+    """Download *url* to *local_path* atomically, retrying transient errors.
+
+    Streams to a ``.tmp`` sibling and md5-hashes incrementally, so multi-GB
+    game files are never buffered in RAM (8 parallel workers each holding a
+    full file would exhaust memory). Retries timeouts, dropped/truncated
+    connections, and md5 mismatches (a truncated body can also close cleanly
+    and only surface as a hash mismatch). The local file is only replaced
+    after the md5 check passes, so a failed attempt never corrupts the
+    existing file.
+
+    *cancel_check* (optional) is polled before each attempt so a cancelled
+    update run stops retrying promptly. *on_retry* (optional) is called as
+    ``on_retry(failed_attempt, error)`` before each backoff sleep.
+    *byte_counter* (optional) is fed each chunk's length so the UI can
+    display aggregate download speed.
+
+    Returns None on success, or an error string.
+    """
+    tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        if cancel_check and cancel_check():
+            tmp_path.unlink(missing_ok=True)
+            return "cancelled"
+        try:
+            md5 = hashlib.md5()
+            with requests.get(
+                url,
+                timeout=60,
+                stream=True,
+                headers={"User-Agent": USER_AGENT},
+            ) as resp:
+                resp.raise_for_status()
+                with open(tmp_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+                        md5.update(chunk)
+                        if byte_counter is not None:
+                            byte_counter.add(len(chunk))
+            if md5.hexdigest() != expected_md5:
+                raise RuntimeError("md5 mismatch (truncated or corrupt download)")
+            tmp_path.replace(local_path)
+            return None
+        except Exception as e:  # noqa: BLE001
+            tmp_path.unlink(missing_ok=True)
+            if attempt >= MAX_DOWNLOAD_RETRIES or (cancel_check and cancel_check()):
+                return str(e)
+            if on_retry:
+                on_retry(attempt, str(e))
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    return "unreachable"  # pragma: no cover
 
 
 def fetch_banner_url() -> str:
@@ -235,7 +336,8 @@ def get_cached_banner_path(preferred_version: str | None = None) -> Path | None:
             return p
 
     candidates = [
-        p for p in BANNER_CACHE_DIR.glob("banner_*.webp")
+        p
+        for p in BANNER_CACHE_DIR.glob("banner_*.webp")
         if p.is_file() and p.stat().st_size > 0
     ]
     if not candidates:
@@ -256,6 +358,9 @@ class UpdateWorker(QThread):
         super().__init__()
         self.config = config
         self._cancel = False
+        # Created here (not in _do_update) so the GUI's speed sampler can
+        # safely read it even before the download phase starts.
+        self.byte_counter = ByteCounter()
 
     def cancel(self):
         self._cancel = True
@@ -263,7 +368,7 @@ class UpdateWorker(QThread):
     def run(self):
         try:
             self._do_update()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             self.finished_signal.emit(False, f"Error: {e}")
 
     def _do_update(self):
@@ -289,9 +394,7 @@ class UpdateWorker(QThread):
                 self.finished_signal.emit(False, "Cancelled")
                 return
             local_path = game_dir / r["dest"]
-            if not local_path.exists():
-                to_download.append(r)
-            elif local_path.stat().st_size != r["size"]:
+            if not local_path.exists() or local_path.stat().st_size != r["size"]:
                 to_download.append(r)
             elif r["size"] < MD5_SKIP_SIZE:
                 with open(local_path, "rb") as f:
@@ -325,24 +428,18 @@ class UpdateWorker(QThread):
         def download_one(r):
             dest = r["dest"]
             local_path = game_dir / dest
-            url = get_download_url(info, dest)
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
-            try:
-                resp = requests.get(
-                    url, timeout=60, headers={"User-Agent": USER_AGENT}
-                )
-                resp.raise_for_status()
-                actual_md5 = hashlib.md5(resp.content).hexdigest()
-                if actual_md5 != r["md5"]:
-                    return (dest, False, "md5 mismatch")
-                with open(tmp_path, "wb") as f:
-                    f.write(resp.content)
-                tmp_path.replace(local_path)
-                return (dest, True, None)
-            except Exception as e:
-                tmp_path.unlink(missing_ok=True)
-                return (dest, False, str(e))
+            err = download_file(
+                get_download_url(info, dest),
+                r["md5"],
+                local_path,
+                cancel_check=lambda: self._cancel,
+                byte_counter=self.byte_counter,
+                on_retry=lambda attempt, e: self.log.emit(
+                    f"Retrying {dest} ({attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {e}"
+                ),
+            )
+            return (dest, err is None, err)
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(download_one, r): r for r in to_download}
@@ -365,6 +462,21 @@ class UpdateWorker(QThread):
 
         self.log.emit(f"Downloaded {downloaded}/{total_dl} ({failed} failed)")
 
+        if failed:
+            # Do NOT write the game configs or record the version on a partial
+            # download: detect_installed_version() reads
+            # launcherDownloadConfig.json, so recording the new version would
+            # make the next startup report "up to date" with files still
+            # missing. Re-running the update re-verifies everything and
+            # downloads only the files that are still wrong.
+            self.finished_signal.emit(
+                False,
+                f"Update incomplete: {failed} of {total_dl} files failed after "
+                f"{MAX_DOWNLOAD_RETRIES} attempts. Run the update again to "
+                f"retry them.",
+            )
+            return
+
         # 5. Create game config files.
         self._create_game_configs(info, resources)
 
@@ -373,13 +485,7 @@ class UpdateWorker(QThread):
         self.config["last_checked_version"] = info["version"]
         save_config(self.config)
 
-        if failed:
-            self.finished_signal.emit(
-                False,
-                f"Updated to {info['version']} with {failed} failed downloads",
-            )
-        else:
-            self.finished_signal.emit(True, f"Updated to {info['version']}")
+        self.finished_signal.emit(True, f"Updated to {info['version']}")
 
     def _create_game_configs(self, version_info: dict, resources: list):
         """Create LocalGameResources.json and launcherDownloadConfig.json."""
@@ -387,9 +493,7 @@ class UpdateWorker(QThread):
         host = version_info["cdn_hosts"][0]
         ver = version_info["version"]
         h = version_info["hash"]
-        from_folder = (
-            f"{host}launcher/game/{GAME_ID}/{APP_ID}/{ver}/{h}/zip/"
-        )
+        from_folder = f"{host}launcher/game/{GAME_ID}/{APP_ID}/{ver}/{h}/zip/"
 
         # launcherDownloadConfig.json
         dl_config = {
@@ -407,7 +511,8 @@ class UpdateWorker(QThread):
         # pointed at the full CDN URL (the game's built-in XUrlPerfixConfig
         # points at wrong hosts).
         streaming = [
-            r for r in resources
+            r
+            for r in resources
             if r["dest"].startswith("PGR_Data/StreamingAssets/resource/")
         ]
         local_res = {
@@ -424,9 +529,7 @@ class UpdateWorker(QThread):
         }
         with open(game_dir / "LocalGameResources.json", "w") as f:
             json.dump(local_res, f, indent=4)
-        self.log.emit(
-            f"Created LocalGameResources.json ({len(streaming)} entries)"
-        )
+        self.log.emit(f"Created LocalGameResources.json ({len(streaming)} entries)")
 
 
 # ─── Game launcher ──────────────────────────────────────────────────
@@ -459,9 +562,17 @@ def launch_game(config: dict) -> subprocess.Popen:
     # it lives under /usr, which the container refuses to bind-mount, so it can
     # never be executed from inside the container.
     cmd = [
-        reaper, "SteamLaunch", "AppId=0", "--",
-        steamrt, "--verb=waitforexitandrun", "--",
-        proton, "waitforexitandrun", exe_z, graphics,
+        reaper,
+        "SteamLaunch",
+        "AppId=0",
+        "--",
+        steamrt,
+        "--verb=waitforexitandrun",
+        "--",
+        proton,
+        "waitforexitandrun",
+        exe_z,
+        graphics,
     ]
 
     return subprocess.Popen(cmd, env=env, cwd=str(game_dir))
@@ -480,9 +591,7 @@ class SettingsDialog(QDialog):
     def _path_row(self, layout, label, value, title, directory=False):
         line = QLineEdit(value)
         browse = QPushButton("Browse...")
-        browse.clicked.connect(
-            lambda: self._browse(line, title, directory=directory)
-        )
+        browse.clicked.connect(lambda: self._browse(line, title, directory=directory))
         holder = QWidget()
         row = QHBoxLayout(holder)
         row.setContentsMargins(0, 0, 0, 0)
@@ -495,23 +604,35 @@ class SettingsDialog(QDialog):
         layout = QFormLayout(self)
 
         self.game_dir = self._path_row(
-            layout, "Game Directory:", self.config["game_dir"],
-            "Select Game Directory", directory=True,
+            layout,
+            "Game Directory:",
+            self.config["game_dir"],
+            "Select Game Directory",
+            directory=True,
         )
         self.proton_path = self._path_row(
-            layout, "Proton Path:", self.config["proton_path"],
+            layout,
+            "Proton Path:",
+            self.config["proton_path"],
             "Select Proton Binary",
         )
         self.prefix_path = self._path_row(
-            layout, "Wine Prefix:", self.config["prefix_path"],
-            "Select Wine Prefix", directory=True,
+            layout,
+            "Wine Prefix:",
+            self.config["prefix_path"],
+            "Select Wine Prefix",
+            directory=True,
         )
         self.steamrt_path = self._path_row(
-            layout, "steamrt Entry Point:", self.config["steamrt_path"],
+            layout,
+            "steamrt Entry Point:",
+            self.config["steamrt_path"],
             "Select steamrt Entry Point",
         )
         self.reaper_path = self._path_row(
-            layout, "Reaper Path:", self.config["reaper_path"],
+            layout,
+            "Reaper Path:",
+            self.config["reaper_path"],
             "Select Reaper Binary",
         )
 
@@ -521,7 +642,7 @@ class SettingsDialog(QDialog):
         idx = self.graphics_api.findData(
             self.config.get("graphics_api", "-force-d3d11")
         )
-        self.graphics_api.setCurrentIndex(idx if idx >= 0 else 0)
+        self.graphics_api.setCurrentIndex(max(idx, 0))
         layout.addRow("Graphics API:", self.graphics_api)
 
         buttons = QHBoxLayout()
@@ -688,10 +809,9 @@ class MainWindow(QMainWindow):
         # Show the best cached banner immediately so the UI is not blank while
         # the network version check runs in the background. The cached image
         # will be replaced later if a newer banner is available.
-        installed_version = (
-            detect_installed_version(self.config["game_dir"])
-            or self.config.get("installed_version")
-        )
+        installed_version = detect_installed_version(
+            self.config["game_dir"]
+        ) or self.config.get("installed_version")
         cached_banner = get_cached_banner_path(installed_version)
         if cached_banner is not None:
             self.bg_widget.set_banner(str(cached_banner))
@@ -710,17 +830,13 @@ class MainWindow(QMainWindow):
         layout.addStretch(10)
 
         title = QLabel(GAME_NAME)
-        title.setStyleSheet(
-            "font-size: 20px; font-weight: bold; color: #a29bfe;"
-        )
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #a29bfe;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
         self.version_label = QLabel("Checking version...")
         self.version_label.setAlignment(Qt.AlignCenter)
-        self.version_label.setStyleSheet(
-            "color: #c0c0c0; font-size: 13px;"
-        )
+        self.version_label.setStyleSheet("color: #c0c0c0; font-size: 13px;")
         layout.addWidget(self.version_label)
 
         self.progress = QProgressBar()
@@ -728,9 +844,16 @@ class MainWindow(QMainWindow):
         self.progress.setFixedHeight(22)
         layout.addWidget(self.progress)
 
+        status_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("color: #d0d0d0;")
-        layout.addWidget(self.status_label)
+        self.speed_label = QLabel("")
+        self.speed_label.setStyleSheet("color: #a0a0a0;")
+        self.speed_label.setVisible(False)
+        status_row.addWidget(self.status_label)
+        status_row.addStretch(1)
+        status_row.addWidget(self.speed_label)
+        layout.addLayout(status_row)
 
         btn_layout = QHBoxLayout()
         self.btn_update = QPushButton("Check for Updates")
@@ -772,10 +895,9 @@ class MainWindow(QMainWindow):
 
         # Detect the installed version from the game files (source of truth),
         # falling back to whatever a prior update run recorded in config.
-        installed = (
-            detect_installed_version(self.config["game_dir"])
-            or self.config.get("installed_version")
-        )
+        installed = detect_installed_version(
+            self.config["game_dir"]
+        ) or self.config.get("installed_version")
         if installed and installed != self.config.get("installed_version"):
             self.config["installed_version"] = installed
             save_config(self.config)
@@ -831,12 +953,34 @@ class MainWindow(QMainWindow):
         self.worker.finished_signal.connect(self._on_update_done)
         self.worker.start()
 
+        # Sample the worker's byte counter once a second to display download
+        # speed. The counter only advances during the download phase, so the
+        # label stays hidden while files are being verified.
+        self._speed_last = 0
+        self._speed_timer = QTimer(self)
+        self._speed_timer.timeout.connect(self._on_speed_tick)
+        self._speed_timer.start(1000)
+
     def _on_progress(self, current, total, msg):
         pct = int(current / total * 100) if total > 0 else 0
         self.progress.setValue(pct)
         self.status_label.setText(msg)
 
+    def _on_speed_tick(self):
+        count = self.worker.byte_counter.count
+        delta = count - self._speed_last
+        self._speed_last = count
+        # Hidden while no bytes arrived this tick: covers the verify phase
+        # and retry backoffs, where a "0 B/s" readout would be misleading.
+        if delta > 0:
+            self.speed_label.setText(format_speed(delta))
+            self.speed_label.setVisible(True)
+        else:
+            self.speed_label.setVisible(False)
+
     def _on_update_done(self, success, message):
+        self._speed_timer.stop()
+        self.speed_label.setVisible(False)
         self.progress.setVisible(False)
         self.btn_cancel.setVisible(False)
         self.status_label.setText(message)
@@ -859,7 +1003,8 @@ class MainWindow(QMainWindow):
         exe_path = Path(self.config["game_dir"]) / GAME_EXE
         if not exe_path.exists():
             QMessageBox.warning(
-                self, "Error",
+                self,
+                "Error",
                 "PGR.exe not found. Check game directory in Settings.",
             )
             return
@@ -913,6 +1058,21 @@ def main():
         _run_api_test()
         return
     app = QApplication(sys.argv)
+
+    # Single-instance guard: two launchers downloading into the same game dir
+    # race on the same .tmp files (the loser's atomic rename fails with ENOENT
+    # after the winner already moved the file into place). QLockFile also
+    # recovers the lock automatically after a crash via dead-PID detection.
+    lock = QLockFile(str(Path(__file__).parent / ".launcher.lock"))
+    if not lock.tryLock(0):
+        QMessageBox.critical(
+            None,
+            GAME_NAME,
+            "Another instance of the launcher is already running.\n"
+            "Close it before starting a new one.",
+        )
+        sys.exit(1)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
