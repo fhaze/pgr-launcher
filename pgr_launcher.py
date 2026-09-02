@@ -2,23 +2,27 @@
 """PGR BiliBili CN Updater + Launcher.
 
 Standalone updater and launcher for Punishing: Gray Raven (BiliBili CN) on
-Linux. Fetches version info from Kurogame's stable CDN config endpoint, verifies
-every game file by md5 against the indexFile, downloads any missing/mismatched
-files directly from the launcher CDN, writes the game config files the in-game
-downloader needs, and launches the game through Proton/steamrt.
+Linux. Fetches Kurogame's CDN metadata, applies official bundled or incremental
+packages in manifest order, verifies the resulting game files, repairs any
+remaining mismatches, writes the in-game downloader configuration, and launches
+the game through Proton/steamrt.
 """
 
 import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock, Thread, local
+from urllib.parse import quote, urljoin
 
 import requests
 from PySide6.QtCore import Qt, QLockFile, QThread, QTimer, Signal
@@ -75,6 +79,7 @@ MD5_SKIP_SIZE = 100_000_000
 # truncated connections). Attempts are spaced by a linear backoff.
 MAX_DOWNLOAD_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
+STAGING_DIR_NAME = ".pgr-launcher-staging"
 
 # ─── Config ─────────────────────────────────────────────────────────
 
@@ -158,8 +163,24 @@ def fetch_cdn_config() -> dict:
     return resp.json()
 
 
+def _make_download_plan(
+    config: dict, kind: str, target_version: str, source_version: str | None = None
+) -> dict:
+    return {
+        "kind": kind,
+        "version": target_version,
+        "source_version": source_version,
+        "base_url": config["baseUrl"],
+        "index_file_path": config["indexFile"],
+        "index_file_md5": config.get("indexFileMd5"),
+        "size": config.get("size", 0),
+        "uncompress_size": config.get("unCompressSize", config.get("size", 0)),
+        "max_file_size": config.get("ext", {}).get("maxFileSize", 0),
+    }
+
+
 def parse_version_info(cdn_config: dict) -> dict:
-    """Extract version, hash, CDN hosts, and indexFile URL from the config."""
+    """Extract all usable download plans from the CDN config."""
     default = cdn_config["default"]
     cdn_hosts = [c["url"] for c in default["cdnList"]]
     cfg = default["config"]
@@ -167,31 +188,274 @@ def parse_version_info(cdn_config: dict) -> dict:
     # baseUrl is "launcher/game/<gameId>/<appId>/<version>/<HASH>/zip/", so the
     # hash is the segment right after the version (index 5, not 4).
     base_parts = cfg["baseUrl"].strip("/").split("/")
-    version_hash = base_parts[5]
+    full_plan = _make_download_plan(cfg, "full", version)
+    zip_plan = None
+    if cfg.get("zipConfig"):
+        zip_plan = _make_download_plan(cfg["zipConfig"], "zip", version)
+    patch_plans = [
+        _make_download_plan(p, "patch", version, p["version"])
+        for p in cfg.get("patchConfig", [])
+    ]
     return {
         "version": version,
-        "hash": version_hash,
+        "hash": base_parts[5],
         "cdn_hosts": cdn_hosts,
         "index_file_path": cfg["indexFile"],
         "full_size": cfg["size"],
+        "full_plan": full_plan,
+        "zip_plan": zip_plan,
+        "patch_plans": patch_plans,
     }
+
+
+def select_download_plan(
+    version_info: dict, installed_version: str | None, game_present: bool
+) -> dict:
+    if game_present and installed_version != version_info["version"]:
+        for plan in version_info["patch_plans"]:
+            if plan["source_version"] == installed_version:
+                return plan
+    if not game_present and version_info["zip_plan"] is not None:
+        return version_info["zip_plan"]
+    return version_info["full_plan"]
+
+
+def _resolve_cdn_path(host: str, path: str) -> str:
+    if path.startswith(("http://", "https://")):
+        return path
+    return urljoin(host.rstrip("/") + "/", path.lstrip("/"))
+
+
+def _normalize_resource_dest(dest: str) -> str:
+    if not dest or "\x00" in dest:
+        raise ValueError(f"unsafe resource path: {dest!r}")
+    normalized = dest.replace("\\", "/")
+    if normalized.startswith("/"):
+        raise ValueError(f"unsafe resource path: {dest!r}")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or ".." in parts:
+        raise ValueError(f"unsafe resource path: {dest!r}")
+    return "/".join(parts)
+
+
+def resolve_resource_url(
+    version_info: dict, plan: dict, resource: dict, host_index: int = 0
+) -> str:
+    host = version_info["cdn_hosts"][host_index]
+    folder = resource.get("fromFolder") or plan["base_url"]
+    base = _resolve_cdn_path(host, folder).rstrip("/") + "/"
+    return base + quote(_normalize_resource_dest(resource["dest"]), safe="/")
+
+
+def fetch_index_document(version_info: dict, plan: dict | None = None) -> dict:
+    plan = plan or version_info["full_plan"]
+    errors = []
+    for host in version_info["cdn_hosts"]:
+        url = _resolve_cdn_path(host, plan["index_file_path"])
+        try:
+            resp = requests.get(
+                url, timeout=(15, 90), headers={"User-Agent": USER_AGENT}
+            )
+            resp.raise_for_status()
+            payload = resp.content
+            expected_md5 = plan.get("index_file_md5")
+            if expected_md5 and hashlib.md5(payload).hexdigest() != expected_md5:
+                raise RuntimeError("md5 mismatch")
+            return resp.json()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{host}: {e}")
+    raise RuntimeError(
+        f"Could not fetch {plan['kind']} index from any CDN: {'; '.join(errors)}"
+    )
 
 
 def fetch_index_file(version_info: dict) -> list:
     """Fetch the full indexFile and return the resource list."""
-    host = version_info["cdn_hosts"][0]  # alicdn, highest priority
-    url = host + version_info["index_file_path"]
-    resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
-    resp.raise_for_status()
-    return resp.json()["resource"]
+    return fetch_index_document(version_info)["resource"]
 
 
 def get_download_url(version_info: dict, dest: str) -> str:
-    """Construct the download URL for a game file."""
-    host = version_info["cdn_hosts"][0]
-    ver = version_info["version"]
-    h = version_info["hash"]
-    return f"{host}launcher/game/{GAME_ID}/{APP_ID}/{ver}/{h}/zip/{dest}"
+    """Construct the full-plan download URL for a game file."""
+    return resolve_resource_url(
+        version_info, version_info["full_plan"], {"dest": dest}
+    )
+
+
+def package_output_map(index_document: dict) -> dict[str, dict]:
+    outputs = {}
+    transformed = set()
+    for key in ("zipInfos", "patchInfos"):
+        for group in index_document.get(key, []):
+            transformed.add(group["dest"])
+            for entry in group["entries"]:
+                outputs[entry["dest"]] = entry
+    for group in index_document.get("groupInfos", []):
+        transformed.add(group["dest"])
+        for entry in group.get("dstFiles", []):
+            outputs[entry["dest"]] = entry
+    for resource in index_document["resource"]:
+        if resource["dest"] not in transformed:
+            outputs[resource["dest"]] = resource
+    for dest in index_document.get("deleteFiles", []):
+        outputs.pop(dest, None)
+    return outputs
+
+
+def validate_package_index(
+    index_document: dict, full_resources: list, complete: bool
+) -> dict[str, dict]:
+    outputs = package_output_map(index_document)
+    expected = {r["dest"]: r for r in full_resources}
+    invalid = [
+        dest
+        for dest, resource in outputs.items()
+        if dest not in expected
+        or (resource["size"], resource["md5"])
+        != (expected[dest]["size"], expected[dest]["md5"])
+    ]
+    invalid_deletes = [
+        dest for dest in index_document.get("deleteFiles", []) if dest in expected
+    ]
+    if invalid or invalid_deletes:
+        raise ValueError(
+            f"package manifest disagrees with full index "
+            f"({len(invalid)} outputs, {len(invalid_deletes)} deletions)"
+        )
+    if complete and set(outputs) != set(expected):
+        raise ValueError(
+            f"complete package has {len(outputs)} outputs; expected {len(expected)}"
+        )
+    return outputs
+
+
+def _safe_destination(root: Path, dest: str) -> Path:
+    relative = Path(_normalize_resource_dest(dest))
+    if relative.is_absolute():
+        raise ValueError(f"unsafe resource path: {dest!r}")
+    resolved_root = root.resolve()
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as e:
+        raise ValueError(f"resource path escapes destination: {dest!r}") from e
+    if resolved == resolved_root:
+        raise ValueError(f"unsafe resource path: {dest!r}")
+    return resolved
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_matches(path: Path, resource: dict) -> bool:
+    return (
+        path.is_file()
+        and path.stat().st_size == resource["size"]
+        and _hash_file(path) == resource["md5"]
+    )
+
+
+def extract_zip_archive(
+    archive_path: Path,
+    destination: Path,
+    entries: list,
+    cancel_check=None,
+    on_progress=None,
+) -> int:
+    destination.mkdir(parents=True, exist_ok=True)
+    extracted = 0
+    total = sum(entry["size"] for entry in entries)
+    with zipfile.ZipFile(archive_path) as archive:
+        members = {}
+        for member in archive.infolist():
+            if member.is_dir():
+                continue
+            name = member.filename.rstrip("/")
+            if name in members:
+                raise ValueError(f"archive contains duplicate entry: {name}")
+            members[name] = member
+        for entry in entries:
+            if cancel_check and cancel_check():
+                raise RuntimeError("cancelled")
+            dest = entry["dest"].replace("\\", "/")
+            target = _safe_destination(destination, dest)
+            member = members.get(dest)
+            if member is None:
+                raise ValueError(f"archive is missing {dest}")
+            if member.file_size != entry["size"]:
+                raise ValueError(f"archive entry has the wrong size: {dest}")
+            if stat.S_ISLNK(member.external_attr >> 16):
+                raise ValueError(f"archive entry is a symlink: {dest}")
+            if _file_matches(target, entry):
+                extracted += entry["size"]
+                if on_progress:
+                    on_progress(extracted, total, dest)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = target.with_name(target.name + ".extracting")
+            digest = hashlib.md5()
+            written = 0
+            try:
+                with archive.open(member) as src, open(tmp_path, "wb") as dst:
+                    while chunk := src.read(1024 * 1024):
+                        if cancel_check and cancel_check():
+                            raise RuntimeError("cancelled")
+                        dst.write(chunk)
+                        digest.update(chunk)
+                        written += len(chunk)
+                        if written > entry["size"]:
+                            raise RuntimeError(
+                                f"archive entry exceeds expected size: {dest}"
+                            )
+                if written != entry["size"] or digest.hexdigest() != entry["md5"]:
+                    raise RuntimeError(f"archive entry verification failed: {dest}")
+                tmp_path.replace(target)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
+            extracted += written
+            if on_progress:
+                on_progress(extracted, total, dest)
+    return extracted
+
+
+def _entries_match(root: Path, entries: list, cancel_check=None) -> bool:
+    for entry in entries:
+        if cancel_check and cancel_check():
+            raise RuntimeError("cancelled")
+        if not _file_matches(_safe_destination(root, entry["dest"]), entry):
+            return False
+    return True
+
+
+def _delete_manifest_paths(root: Path, destinations: list):
+    for dest in destinations:
+        path = _safe_destination(root, dest)
+        if path.is_dir():
+            raise ValueError(f"refusing to delete directory from manifest: {dest}")
+        path.unlink(missing_ok=True)
+
+
+def _merge_staged_tree(
+    source: Path, destination: Path, cancel_check=None, on_progress=None
+):
+    files = [path for path in source.rglob("*") if path.is_file()]
+    total = len(files)
+    for index, path in enumerate(files, 1):
+        if cancel_check and cancel_check():
+            raise RuntimeError("cancelled")
+        if path.is_symlink():
+            raise ValueError(f"staged file is a symlink: {path}")
+        relative = path.relative_to(source).as_posix()
+        target = _safe_destination(destination, relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        path.replace(target)
+        if on_progress:
+            on_progress(index, total, relative)
 
 
 class ByteCounter:
@@ -221,6 +485,18 @@ def format_speed(bytes_per_sec: float) -> str:
     return f"{bytes_per_sec:.0f} B/s"
 
 
+_download_session_state = local()
+
+
+def _get_download_session() -> requests.Session:
+    session = getattr(_download_session_state, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT})
+        _download_session_state.session = session
+    return session
+
+
 def download_file(
     url: str,
     expected_md5: str,
@@ -228,51 +504,79 @@ def download_file(
     cancel_check=None,
     on_retry=None,
     byte_counter=None,
+    expected_size: int | None = None,
+    session=None,
 ) -> str | None:
-    """Download *url* to *local_path* atomically, retrying transient errors.
-
-    Streams to a ``.tmp`` sibling and md5-hashes incrementally, so multi-GB
-    game files are never buffered in RAM (8 parallel workers each holding a
-    full file would exhaust memory). Retries timeouts, dropped/truncated
-    connections, and md5 mismatches (a truncated body can also close cleanly
-    and only surface as a hash mismatch). The local file is only replaced
-    after the md5 check passes, so a failed attempt never corrupts the
-    existing file.
-
-    *cancel_check* (optional) is polled before each attempt so a cancelled
-    update run stops retrying promptly. *on_retry* (optional) is called as
-    ``on_retry(failed_attempt, error)`` before each backoff sleep.
-    *byte_counter* (optional) is fed each chunk's length so the UI can
-    display aggregate download speed.
-
-    Returns None on success, or an error string.
-    """
+    """Download *url* atomically with retries and HTTP range resumption."""
+    local_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+    client = session or requests
     for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
         if cancel_check and cancel_check():
-            tmp_path.unlink(missing_ok=True)
             return "cancelled"
         try:
-            md5 = hashlib.md5()
-            with requests.get(
+            resume_from = tmp_path.stat().st_size if tmp_path.exists() else 0
+            if expected_size is None or resume_from > expected_size:
+                tmp_path.unlink(missing_ok=True)
+                resume_from = 0
+            if expected_size is not None and resume_from == expected_size:
+                if _hash_file(tmp_path) == expected_md5:
+                    tmp_path.replace(local_path)
+                    return None
+                tmp_path.unlink()
+                resume_from = 0
+
+            headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity"}
+            if resume_from:
+                headers["Range"] = f"bytes={resume_from}-"
+            with client.get(
                 url,
-                timeout=60,
+                timeout=(15, 60),
                 stream=True,
-                headers={"User-Agent": USER_AGENT},
+                headers=headers,
             ) as resp:
+                if resume_from and resp.status_code == 416:
+                    tmp_path.unlink(missing_ok=True)
+                    raise RuntimeError("CDN rejected the partial range; restarting")
                 resp.raise_for_status()
-                with open(tmp_path, "wb") as f:
+                append = resume_from > 0 and resp.status_code == 206
+                if append:
+                    content_range = resp.headers.get("Content-Range", "")
+                    if not content_range.startswith(f"bytes {resume_from}-"):
+                        tmp_path.unlink(missing_ok=True)
+                        raise RuntimeError("CDN returned an invalid range; restarting")
+                    digest = hashlib.md5()
+                    with open(tmp_path, "rb") as existing:
+                        while chunk := existing.read(1024 * 1024):
+                            digest.update(chunk)
+                    mode = "ab"
+                else:
+                    resume_from = 0
+                    digest = hashlib.md5()
+                    mode = "wb"
+                with open(tmp_path, mode) as f:
                     for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if cancel_check and cancel_check():
+                            return "cancelled"
+                        if not chunk:
+                            continue
                         f.write(chunk)
-                        md5.update(chunk)
+                        digest.update(chunk)
                         if byte_counter is not None:
                             byte_counter.add(len(chunk))
-            if md5.hexdigest() != expected_md5:
+            actual_size = tmp_path.stat().st_size
+            if expected_size is not None and actual_size != expected_size:
+                raise RuntimeError(
+                    f"size mismatch ({actual_size} bytes, expected {expected_size})"
+                )
+            if digest.hexdigest() != expected_md5:
+                tmp_path.unlink(missing_ok=True)
                 raise RuntimeError("md5 mismatch (truncated or corrupt download)")
             tmp_path.replace(local_path)
             return None
         except Exception as e:  # noqa: BLE001
-            tmp_path.unlink(missing_ok=True)
+            if expected_size is None:
+                tmp_path.unlink(missing_ok=True)
             if attempt >= MAX_DOWNLOAD_RETRIES or (cancel_check and cancel_check()):
                 return str(e)
             if on_retry:
@@ -369,10 +673,12 @@ class UpdateWorker(QThread):
         try:
             self._do_update()
         except Exception as e:  # noqa: BLE001
-            self.finished_signal.emit(False, f"Error: {e}")
+            message = "Cancelled" if str(e) == "cancelled" else f"Error: {e}"
+            self.finished_signal.emit(False, message)
 
     def _do_update(self):
         game_dir = Path(self.config["game_dir"])
+        game_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Fetch CDN config.
         self.log.emit("Fetching CDN config...")
@@ -381,102 +687,72 @@ class UpdateWorker(QThread):
         self.log.emit(f"Latest version: {info['version']}")
 
         # 2. Fetch indexFile.
-        self.log.emit("Fetching file index...")
-        resources = fetch_index_file(info)
+        self.log.emit("Fetching full file index...")
+        full_document = fetch_index_document(info)
+        resources = full_document["resource"]
         self.log.emit(f"Total files in index: {len(resources)}")
 
-        # 3. Verify all files by size + md5.
-        self.log.emit("Verifying files...")
-        to_download = []
-        total = len(resources)
-        for i, r in enumerate(resources):
-            if self._cancel:
-                self.finished_signal.emit(False, "Cancelled")
-                return
-            local_path = game_dir / r["dest"]
-            if not local_path.exists() or local_path.stat().st_size != r["size"]:
-                to_download.append(r)
-            elif r["size"] < MD5_SKIP_SIZE:
-                with open(local_path, "rb") as f:
-                    actual_md5 = hashlib.md5(f.read()).hexdigest()
-                if actual_md5 != r["md5"]:
-                    to_download.append(r)
+        game_present = (game_dir / GAME_EXE).is_file()
+        installed = detect_installed_version(game_dir) if game_present else None
+        plan = select_download_plan(info, installed, game_present)
+        verified = set()
+        used_package = False
 
-            if (i + 1) % 500 == 0 or i == total - 1:
-                self.progress.emit(i + 1, total, f"Verifying... {i + 1}/{total}")
-
-        if not to_download:
-            self.log.emit("All files verified. No update needed.")
-            self._create_game_configs(info, resources)
-            self.config["installed_version"] = info["version"]
-            self.config["last_checked_version"] = info["version"]
-            save_config(self.config)
-            self.finished_signal.emit(True, f"Ready — version {info['version']}")
-            return
-
-        total_dl_size = sum(r["size"] for r in to_download)
-        self.log.emit(
-            f"Need to download {len(to_download)} files "
-            f"({total_dl_size / 1024 / 1024:.0f} MB)"
-        )
-
-        # 4. Download missing/mismatched files in parallel.
-        total_dl = len(to_download)
-        downloaded = 0
-        failed = 0
-
-        def download_one(r):
-            dest = r["dest"]
-            local_path = game_dir / dest
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            err = download_file(
-                get_download_url(info, dest),
-                r["md5"],
-                local_path,
-                cancel_check=lambda: self._cancel,
-                byte_counter=self.byte_counter,
-                on_retry=lambda attempt, e: self.log.emit(
-                    f"Retrying {dest} ({attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {e}"
-                ),
+        if plan["kind"] != "full":
+            self.log.emit(f"Fetching {plan['kind']} package index...")
+            package_document = fetch_index_document(info, plan)
+            unsupported = package_document.get("patchInfos") or package_document.get(
+                "groupInfos"
             )
-            return (dest, err is None, err)
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(download_one, r): r for r in to_download}
-            for future in as_completed(futures):
-                if self._cancel:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    self.finished_signal.emit(False, "Cancelled")
-                    return
-                dest, ok, err = future.result()
-                if ok:
-                    downloaded += 1
-                else:
-                    failed += 1
-                    self.log.emit(f"Failed: {dest}: {err}")
-                done = downloaded + failed
-                if done % 50 == 0 or done == total_dl:
-                    self.progress.emit(
-                        done, total_dl, f"Downloading... {done}/{total_dl}"
+            try:
+                if unsupported:
+                    raise ValueError("package uses unsupported binary-diff entries")
+                validate_package_index(
+                    package_document, resources, complete=plan["kind"] == "zip"
+                )
+            except (KeyError, ValueError) as e:
+                self.log.emit(f"Package plan is unusable; using full repair: {e}")
+                plan = info["full_plan"]
+            else:
+                self._check_package_space(game_dir, plan)
+                if plan["kind"] == "zip":
+                    self.log.emit(
+                        f"Using bundled install: {len(package_document['resource'])} "
+                        f"download objects"
                     )
+                else:
+                    self.log.emit(
+                        f"Using patch {plan['source_version']} → {info['version']}: "
+                        f"{len(package_document['resource'])} download objects"
+                    )
+                verified = self._apply_package_plan(
+                    info, plan, package_document, game_dir
+                )
+                used_package = True
 
-        self.log.emit(f"Downloaded {downloaded}/{total_dl} ({failed} failed)")
-
-        if failed:
-            # Do NOT write the game configs or record the version on a partial
-            # download: detect_installed_version() reads
-            # launcherDownloadConfig.json, so recording the new version would
-            # make the next startup report "up to date" with files still
-            # missing. Re-running the update re-verifies everything and
-            # downloads only the files that are still wrong.
-            self.finished_signal.emit(
-                False,
-                f"Update incomplete: {failed} of {total_dl} files failed after "
-                f"{MAX_DOWNLOAD_RETRIES} attempts. Run the update again to "
-                f"retry them.",
+        # 3. Verify all files by size + md5.
+        to_download = self._find_invalid_resources(resources, game_dir, verified)
+        if to_download:
+            total_dl_size = sum(r["size"] for r in to_download)
+            self.log.emit(
+                f"Need to repair {len(to_download)} files "
+                f"({total_dl_size / 1024 / 1024:.0f} MB)"
             )
-            return
 
+            # 4. Download missing/mismatched files in parallel.
+            self._download_full_resources(info, to_download, game_dir)
+        else:
+            self.log.emit("All files verified. No additional repair needed.")
+
+        if self._cancel:
+            raise RuntimeError("cancelled")
+
+        # Do NOT write the game configs or record the version on a partial
+        # download: detect_installed_version() reads
+        # launcherDownloadConfig.json, so recording the new version would
+        # make the next startup report "up to date" with files still
+        # missing. Re-running the update re-verifies everything and
+        # downloads only the files that are still wrong.
         # 5. Create game config files.
         self._create_game_configs(info, resources)
 
@@ -484,16 +760,318 @@ class UpdateWorker(QThread):
         self.config["installed_version"] = info["version"]
         self.config["last_checked_version"] = info["version"]
         save_config(self.config)
+        shutil.rmtree(game_dir / STAGING_DIR_NAME, ignore_errors=True)
 
-        self.finished_signal.emit(True, f"Updated to {info['version']}")
+        if used_package or to_download or installed != info["version"]:
+            message = f"Updated to {info['version']}"
+        else:
+            message = f"Ready — version {info['version']}"
+        self.finished_signal.emit(True, message)
+
+    def _run_tasks(self, resources: list, task, label: str) -> set[str]:
+        if not resources:
+            return set()
+        completed = set()
+        errors = []
+        total = len(resources)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(task, resource): resource for resource in resources
+            }
+            for done, future in enumerate(as_completed(futures), 1):
+                resource = futures[future]
+                try:
+                    completed.add(future.result())
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{resource['dest']}: {e}")
+                if done % 50 == 0 or done == total:
+                    self.progress.emit(done, total, f"{label}... {done}/{total}")
+                if self._cancel:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise RuntimeError("cancelled")
+        if errors:
+            for error in errors[:10]:
+                self.log.emit(f"Failed: {error}")
+            raise RuntimeError(
+                f"{label} failed for {len(errors)} of {total} objects"
+            )
+        return completed
+
+    def _download_resource(
+        self, version_info: dict, plan: dict, resource: dict, target: Path
+    ) -> str:
+        if _file_matches(target, resource):
+            return resource["dest"]
+        errors = []
+        for host_index in range(len(version_info["cdn_hosts"])):
+            err = download_file(
+                resolve_resource_url(version_info, plan, resource, host_index),
+                resource["md5"],
+                target,
+                cancel_check=lambda: self._cancel,
+                byte_counter=self.byte_counter,
+                expected_size=resource["size"],
+                session=_get_download_session(),
+                on_retry=lambda attempt, e: self.log.emit(
+                    f"Retrying {resource['dest']} "
+                    f"({attempt + 1}/{MAX_DOWNLOAD_RETRIES}): {e}"
+                ),
+            )
+            if err is None:
+                return resource["dest"]
+            if err == "cancelled":
+                raise RuntimeError("cancelled")
+            errors.append(err)
+            if host_index + 1 < len(version_info["cdn_hosts"]):
+                self.log.emit(f"Switching CDN for {resource['dest']}: {err}")
+        raise RuntimeError("; ".join(errors))
+
+    def _download_resources(
+        self,
+        version_info: dict,
+        plan: dict,
+        resources: list,
+        destination: Path,
+        label: str,
+    ) -> set[str]:
+        def download_one(resource):
+            target = _safe_destination(destination, resource["dest"])
+            return self._download_resource(version_info, plan, resource, target)
+
+        return self._run_tasks(resources, download_one, label)
+
+    def _plan_signature(self, plan: dict) -> dict:
+        return {
+            "kind": plan["kind"],
+            "version": plan["version"],
+            "source_version": plan["source_version"],
+            "index_file_path": plan["index_file_path"],
+            "index_file_md5": plan["index_file_md5"],
+        }
+
+    def _check_package_space(self, game_dir: Path, plan: dict):
+        state_path = game_dir / STAGING_DIR_NAME / "plan.json"
+        if state_path.is_file():
+            try:
+                if json.loads(state_path.read_text()) == self._plan_signature(plan):
+                    return
+            except (OSError, json.JSONDecodeError):
+                pass
+        required = max(plan["size"], plan["uncompress_size"]) + plan["max_file_size"]
+        available = shutil.disk_usage(game_dir).free
+        if available < required:
+            raise RuntimeError(
+                f"Not enough disk space for {plan['kind']} plan: "
+                f"need {required / 1024**3:.1f} GiB free, "
+                f"have {available / 1024**3:.1f} GiB"
+            )
+
+    def _prepare_work_dir(self, game_dir: Path, plan: dict) -> Path:
+        work_dir = game_dir / STAGING_DIR_NAME
+        signature = self._plan_signature(plan)
+        state_path = work_dir / "plan.json"
+        current = None
+        if state_path.is_file():
+            try:
+                current = json.loads(state_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                pass
+        if work_dir.is_symlink():
+            raise ValueError(f"staging directory is a symlink: {work_dir}")
+        if work_dir.exists() and current != signature:
+            shutil.rmtree(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        tmp_state = work_dir / "plan.json.tmp"
+        tmp_state.write_text(json.dumps(signature, indent=2))
+        tmp_state.replace(state_path)
+        return work_dir
+
+    def _apply_package_plan(
+        self, version_info: dict, plan: dict, document: dict, game_dir: Path
+    ) -> set[str]:
+        work_dir = self._prepare_work_dir(game_dir, plan)
+        archive_dir = work_dir / "archives"
+        raw_dir = work_dir / "raw"
+        assembled_dir = work_dir / "assembled"
+        for directory in (archive_dir, raw_dir, assembled_dir):
+            if directory.is_symlink():
+                raise ValueError(f"staging path is a symlink: {directory}")
+            directory.mkdir(parents=True, exist_ok=True)
+
+        zip_group_list = document.get("zipInfos", [])
+        zip_groups = {group["dest"]: group for group in zip_group_list}
+        if len(zip_groups) != len(zip_group_list):
+            raise ValueError("zipInfos contains duplicate archives")
+        resource_by_dest = {
+            resource["dest"]: resource for resource in document["resource"]
+        }
+        if len(resource_by_dest) != len(document["resource"]):
+            raise ValueError("package contains duplicate resources")
+        try:
+            archive_resources = [
+                resource_by_dest[group["dest"]] for group in zip_group_list
+            ]
+        except KeyError as e:
+            raise ValueError("zipInfos does not match archive resources") from e
+        direct_resources = [
+            resource
+            for resource in document["resource"]
+            if resource["dest"] not in zip_groups
+        ]
+        direct_destinations = {resource["dest"] for resource in direct_resources}
+        deleted = set(document.get("deleteFiles", []))
+        outputs = package_output_map(document)
+        verified = set()
+
+        archive_entries = {
+            resource["dest"]: [
+                entry
+                for entry in zip_groups[resource["dest"]]["entries"]
+                if entry["dest"] not in direct_destinations
+                and entry["dest"] not in deleted
+                and entry["dest"] in outputs
+                and (entry["size"], entry["md5"])
+                == (
+                    outputs[entry["dest"]]["size"],
+                    outputs[entry["dest"]]["md5"],
+                )
+            ]
+            for resource in archive_resources
+        }
+        needed_archives = []
+        for resource in archive_resources:
+            entries = archive_entries[resource["dest"]]
+            assembled_ready = _entries_match(
+                assembled_dir, entries, lambda: self._cancel
+            )
+            game_ready = not assembled_ready and _entries_match(
+                game_dir, entries, lambda: self._cancel
+            )
+            if assembled_ready:
+                verified.update(entry["dest"] for entry in entries)
+                _safe_destination(archive_dir, resource["dest"]).unlink(missing_ok=True)
+            elif game_ready:
+                _delete_manifest_paths(
+                    assembled_dir, [entry["dest"] for entry in entries]
+                )
+                verified.update(entry["dest"] for entry in entries)
+                _safe_destination(archive_dir, resource["dest"]).unlink(missing_ok=True)
+            else:
+                needed_archives.append(resource)
+        self._download_resources(
+            version_info, plan, needed_archives, archive_dir, "Downloading archives"
+        )
+        for index, resource in enumerate(needed_archives, 1):
+            entries = archive_entries[resource["dest"]]
+            archive_path = _safe_destination(archive_dir, resource["dest"])
+            self.log.emit(
+                f"Extracting archive {index}/{len(needed_archives)}: "
+                f"{resource['dest']} ({len(entries)} files)"
+            )
+            last_reported = [0]
+
+            def extraction_progress(done, total, dest):
+                if done - last_reported[0] >= 16 * 1024 * 1024 or done == total:
+                    last_reported[0] = done
+                    self.progress.emit(
+                        done,
+                        total,
+                        f"Extracting {resource['dest']}... "
+                        f"{done / 1024**2:.0f}/{total / 1024**2:.0f} MB",
+                    )
+
+            extract_zip_archive(
+                archive_path,
+                assembled_dir,
+                entries,
+                cancel_check=lambda: self._cancel,
+                on_progress=extraction_progress,
+            )
+            archive_path.unlink()
+            verified.update(entry["dest"] for entry in entries)
+
+        def download_direct(resource):
+            final_path = _safe_destination(game_dir, resource["dest"])
+            assembled_path = _safe_destination(assembled_dir, resource["dest"])
+            assembled_ready = _file_matches(assembled_path, resource)
+            if assembled_ready:
+                return resource["dest"]
+            if _file_matches(final_path, resource):
+                _delete_manifest_paths(assembled_dir, [resource["dest"]])
+                return resource["dest"]
+            raw_path = _safe_destination(raw_dir, resource["dest"])
+            self._download_resource(version_info, plan, resource, raw_path)
+            assembled_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.replace(assembled_path)
+            return resource["dest"]
+
+        verified.update(
+            self._run_tasks(direct_resources, download_direct, "Downloading game files")
+        )
+        expected_verified = set(outputs)
+        if verified != expected_verified:
+            raise RuntimeError(
+                f"package verified {len(verified)} outputs; "
+                f"expected {len(expected_verified)}"
+            )
+        _delete_manifest_paths(assembled_dir, list(deleted))
+        self.log.emit("Installing staged files...")
+
+        def merge_progress(done, total, dest):
+            if done % 100 == 0 or done == total:
+                self.progress.emit(done, total, f"Installing... {done}/{total}")
+
+        _merge_staged_tree(
+            assembled_dir,
+            game_dir,
+            cancel_check=lambda: self._cancel,
+            on_progress=merge_progress,
+        )
+        _delete_manifest_paths(game_dir, list(deleted))
+        return verified
+
+    def _find_invalid_resources(
+        self, resources: list, game_dir: Path, verified: set[str]
+    ) -> list:
+        self.log.emit("Verifying files...")
+        invalid = []
+        total = len(resources)
+        for index, resource in enumerate(resources, 1):
+            if self._cancel:
+                raise RuntimeError("cancelled")
+            local_path = _safe_destination(game_dir, resource["dest"])
+            if (
+                not local_path.is_file()
+                or local_path.stat().st_size != resource["size"]
+            ):
+                invalid.append(resource)
+            elif resource["dest"] not in verified and resource["size"] < MD5_SKIP_SIZE:
+                if _hash_file(local_path) != resource["md5"]:
+                    invalid.append(resource)
+            if index % 500 == 0 or index == total:
+                self.progress.emit(index, total, f"Verifying... {index}/{total}")
+        return invalid
+
+    def _download_full_resources(
+        self, version_info: dict, resources: list, game_dir: Path
+    ):
+        plan = version_info["full_plan"]
+
+        def download_one(resource):
+            target = _safe_destination(game_dir, resource["dest"])
+            return self._download_resource(version_info, plan, resource, target)
+
+        self._run_tasks(resources, download_one, "Downloading repairs")
 
     def _create_game_configs(self, version_info: dict, resources: list):
         """Create LocalGameResources.json and launcherDownloadConfig.json."""
         game_dir = Path(self.config["game_dir"])
         host = version_info["cdn_hosts"][0]
         ver = version_info["version"]
-        h = version_info["hash"]
-        from_folder = f"{host}launcher/game/{GAME_ID}/{APP_ID}/{ver}/{h}/zip/"
+        from_folder = (
+            _resolve_cdn_path(host, version_info["full_plan"]["base_url"]).rstrip("/")
+            + "/"
+        )
 
         # launcherDownloadConfig.json
         dl_config = {

@@ -21,23 +21,22 @@ Alternatively install the system packages: `sudo pacman -S pyside6 python-reques
 .venv/bin/python pgr_launcher.py
 ```
 
-- **Check for Updates**: Verifies all game files by md5, downloads any missing/mismatched
+- **Check for Updates**: Applies the best CDN plan, then verifies and repairs game files
 - **Play**: Launches PGR via Proton
 - **Settings**: Configure game directory and runner paths
 
 ## How it works
 
-1. Fetches version info from Kurogame's stable CDN config endpoint
-2. Downloads the full indexFile (~45k entries with md5 hashes)
-3. Verifies every file against the index — no krdiff, no zip blobs
-4. Downloads missing/mismatched files directly from the launcher CDN `zip/` path
-5. Creates `LocalGameResources.json` + `launcherDownloadConfig.json` so the in-game downloader works
-6. Launches via Proton/steamrt with the same command TTL uses
+1. Fetches version info and the full file index from Kurogame's stable CDN config endpoint
+2. Selects the matching `patchConfig` for updates or `zipConfig` for clean installs
+3. Downloads package objects with connection reuse, retries, and HTTP range resumption
+4. Safely extracts `.krzip` bundles, overlays newer direct files, then removes obsolete files
+5. Verifies the result against the full index and directly repairs anything still missing or mismatched
+6. Creates `LocalGameResources.json` + `launcherDownloadConfig.json` so the in-game downloader works
+7. Launches via Proton/steamrt with the same command TTL uses
+
+A clean install currently uses 4,763 CDN objects instead of downloading all ~46k game files individually. If package metadata is unavailable or uses an unsupported binary-diff format, the launcher falls back to full direct-file repair.
 
 ## Why not just use TTL?
 
-TTL v2.3.0 has two bugs that break PGR updates:
-- Doesn't extract `0.krzip` blob → ~27 core files left stale
-- Doesn't create `LocalGameResources.json` → in-game downloader gets 404s
-
-This launcher avoids both by doing full verification + direct CDN downloads.
+TTL v2.3.0 did not reliably apply PGR's package metadata and did not create `LocalGameResources.json`, which could leave stale core files and make the in-game downloader request invalid URLs. This launcher validates the archive/direct-file overlay order against the full manifest and only records the new version after the resulting installation passes verification.
