@@ -33,6 +33,8 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -1261,8 +1263,30 @@ QMainWindow {
     font-size: 13px;
 }
 QLabel {
-    color: #d0d0d0;
+    color: #e6e6f0;
     background: transparent;
+}
+QFrame#hudPanel {
+    background-color: rgba(12, 12, 24, 205);
+    border: 1px solid rgba(162, 155, 254, 70);
+    border-radius: 12px;
+}
+QLabel#titleLabel {
+    font-size: 26px;
+    font-weight: bold;
+    color: #ffffff;
+    letter-spacing: 1px;
+}
+QLabel#versionLabel {
+    font-size: 14px;
+    color: #cfcaff;
+}
+QLabel#statusLabel {
+    color: #f0f0f5;
+    font-weight: bold;
+}
+QLabel#speedLabel {
+    color: #bdbdd0;
 }
 QPushButton {
     background-color: rgba(42, 42, 74, 220);
@@ -1359,9 +1383,9 @@ class BackgroundWidget(QWidget):
 
         gradient = QLinearGradient(0, 0, 0, self.height())
         gradient.setColorAt(0.0, QColor(15, 15, 26, 0))
-        gradient.setColorAt(0.45, QColor(15, 15, 26, 40))
-        gradient.setColorAt(0.75, QColor(15, 15, 26, 180))
-        gradient.setColorAt(1.0, QColor(15, 15, 26, 220))
+        gradient.setColorAt(0.4, QColor(15, 15, 26, 60))
+        gradient.setColorAt(0.7, QColor(15, 15, 26, 200))
+        gradient.setColorAt(1.0, QColor(15, 15, 26, 240))
         painter.fillRect(self.rect(), gradient)
 
     def resizeEvent(self, event):
@@ -1401,20 +1425,30 @@ class MainWindow(QMainWindow):
         self.bg_widget = BackgroundWidget()
         self.setCentralWidget(self.bg_widget)
 
-        layout = QVBoxLayout(self.bg_widget)
-        layout.setContentsMargins(48, 24, 48, 48)
+        outer = QVBoxLayout(self.bg_widget)
+        outer.setContentsMargins(48, 24, 48, 40)
+        outer.addStretch(10)
+
+        # All text and controls live on a translucent panel so they stay
+        # readable regardless of how bright or busy the banner image is.
+        panel = QFrame()
+        panel.setObjectName("hudPanel")
+        outer.addWidget(panel)
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(28, 22, 28, 22)
         layout.setSpacing(12)
 
-        layout.addStretch(10)
-
         title = QLabel(GAME_NAME)
-        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #a29bfe;")
+        title.setObjectName("titleLabel")
         title.setAlignment(Qt.AlignCenter)
+        title.setGraphicsEffect(self._text_shadow())
         layout.addWidget(title)
 
         self.version_label = QLabel("Checking version...")
+        self.version_label.setObjectName("versionLabel")
         self.version_label.setAlignment(Qt.AlignCenter)
-        self.version_label.setStyleSheet("color: #c0c0c0; font-size: 13px;")
+        self.version_label.setGraphicsEffect(self._text_shadow())
         layout.addWidget(self.version_label)
 
         self.progress = QProgressBar()
@@ -1424,9 +1458,9 @@ class MainWindow(QMainWindow):
 
         status_row = QHBoxLayout()
         self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #d0d0d0;")
+        self.status_label.setObjectName("statusLabel")
         self.speed_label = QLabel("")
-        self.speed_label.setStyleSheet("color: #a0a0a0;")
+        self.speed_label.setObjectName("speedLabel")
         self.speed_label.setVisible(False)
         status_row.addWidget(self.status_label)
         status_row.addStretch(1)
@@ -1454,6 +1488,14 @@ class MainWindow(QMainWindow):
         self.btn_play.clicked.connect(self._on_play)
         self.btn_settings.clicked.connect(self._on_settings)
         self.btn_cancel.clicked.connect(self._on_cancel)
+
+    @staticmethod
+    def _text_shadow() -> QGraphicsDropShadowEffect:
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(12)
+        shadow.setOffset(0, 1)
+        shadow.setColor(QColor(0, 0, 0, 230))
+        return shadow
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
